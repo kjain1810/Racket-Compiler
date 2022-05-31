@@ -1,0 +1,1594 @@
+#lang racket
+(require racket/set racket/stream)
+(require racket/fixnum)
+(require data/queue)
+(require graph)
+(require "interp-Lfun.rkt")
+(require "interp-Lfun-prime.rkt")
+(require "interp-Cfun.rkt")
+(require "interp.rkt")
+(require "type-check-Cfun.rkt")
+(require "type-check-Lfun.rkt")
+(require "priority_queue.rkt")
+(require "utilities.rkt")
+(provide (all-defined-out))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Lint examples
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The following compiler pass is just a silly one that doesn't change
+;; anything important, but is nevertheless an example of a pass. It
+;; flips the arguments of +. -Jeremy
+(define (flip-exp e)
+  (match e
+    [(Var x) e]
+    [(Prim 'read '()) (Prim 'read '())]
+    [(Prim '- (list e1)) (Prim '- (list (flip-exp e1)))]
+    [(Prim '+ (list e1 e2)) (Prim '+ (list (flip-exp e2) (flip-exp e1)))]))
+
+(define (flip-Lint e)
+  (match e
+    [(Program info e) (Program info (flip-exp e))]))
+
+
+;; Next we have the partial evaluation pass described in the book.
+(define (pe-neg r)
+  (match r
+    [(Int n) (Int (fx- 0 n))]
+    [else (Prim '- (list r))]))
+
+(define (pe-add r1 r2)
+  (match* (r1 r2)
+    [((Int n1) (Int n2)) (Int (fx+ n1 n2))]
+    [(_ _) (Prim '+ (list r1 r2))]))
+
+(define (pe-exp e)
+  (match e
+    [(Int n) (Int n)]
+    [(Prim 'read '()) (Prim 'read '())]
+    [(Prim '- (list e1)) (pe-neg (pe-exp e1))]
+    [(Prim '+ (list e1 e2)) (pe-add (pe-exp e1) (pe-exp e2))]))
+
+(define (pe-Lint p)
+  (match p
+    [(Program info e) (Program info (pe-exp e))]))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; HW1 Passes
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; shrink : R1 -> R1
+;; Remove `and` and `or` from the language.
+(define (shrink-expr exp)
+  (match exp
+    ; (and e1 e2) => (if e1 e2 #f)
+    [(Prim 'and (list arg1 arg2))
+     (If (shrink-expr arg1) (shrink-expr arg2) (Bool #f))]
+    ; (or e1 e2) => (if e1 #t e2)
+    [(Prim 'or (list arg1 arg2))
+     (If (shrink-expr arg1) (Bool #t)(shrink-expr arg2) )]
+    [(Prim op args)
+     (Prim op (for/list ([arg args]) (shrink-expr arg)))]
+    [(Let x e t)
+     (Let x (shrink-expr e) (shrink-expr t))]
+    [(If e1 e2 e3)
+     (If (shrink-expr e1) (shrink-expr e2) (shrink-expr e3))]
+    [(SetBang x e) (SetBang x (shrink-expr e))]
+    [(Begin es e) (Begin (for/list ([esp es]) (shrink-expr esp)) (shrink-expr e))]
+    [(WhileLoop cnd e) (WhileLoop (shrink-expr cnd) (shrink-expr e))]
+    [(HasType e type) (HasType (shrink-expr e) type)]
+    [(Apply fun args) (Apply (shrink-expr fun) (map shrink-expr args))]
+    [_ exp]))
+
+(define (shrink-def def)
+  (match def
+    [(Def name param rty info body)
+      (Def name param rty info (shrink-expr body))]))
+
+(define (shrink p)
+  (match p
+    [(ProgramDefsExp info defs body)
+      (let* 
+        ([main-fun (Def 'main '() 'Integer '() body)])
+      (ProgramDefs info (map shrink-def (append defs (list main-fun)))))]))
+
+(define (uniquify-exp env)
+  (lambda (e)
+    (match e
+      [(Var x) (Var (dict-ref env x))]
+      [(Let x e body)
+       (let ([new-env (dict-set env x (gensym x))])
+         (Let
+          (dict-ref new-env x)
+          ((uniquify-exp env) e)
+          ((uniquify-exp new-env) body)))]
+      [(Prim op es)
+       (Prim op (for/list ([e es]) ((uniquify-exp env) e)))]
+      [(If e1 e2 e3)
+       (If ((uniquify-exp env) e1) ((uniquify-exp env) e2) ((uniquify-exp env) e3))]
+      [(SetBang x e)
+       (SetBang (dict-ref env x) ((uniquify-exp env) e))]
+      [(Begin es e)
+       (Begin (for/list ([esp es]) ((uniquify-exp env) esp)) ((uniquify-exp env) e))]
+      [(WhileLoop cnd e)
+       (WhileLoop ((uniquify-exp env) cnd) ((uniquify-exp env) e))]
+      [(HasType expr type) (HasType ((uniquify-exp env) expr) type)]
+      [(Apply fun args)
+       (Apply
+        ((uniquify-exp env) fun)
+        (for/list ([arg args]) ((uniquify-exp env) arg)))]
+      [_ e])))
+
+(define (uniquify-def def env)
+  (match def
+    [(Def name params rty info body)
+     (define new-params
+      (for/list
+         ([param params])
+       (let ([param-name
+              (match param
+                [`(,x : ,t) x])])
+         (dict-set! env param-name (gensym param-name)))
+        (match param
+          [`(,x : ,t) (let ([x-new (dict-ref env x)]) `(,x-new : ,t))])))
+      (Def 
+        name 
+        new-params
+        rty 
+        info 
+        ((uniquify-exp (hash->list env)) body))]))
+
+(define (uniquify-defs defs env)
+  (for/list ([def defs]) (uniquify-def def env)))
+
+;; uniquify : R1 -> R1
+(define (uniquify p)
+  (define (build-env defs)
+    (let* (
+           [def-names (map (lambda (x) (match x [(Def name _ _ _ _) name])) defs)]
+           [def-names-no-main (drop-right def-names 1)]
+           [env (make-hash)])
+      (for ([name def-names-no-main]) (dict-set! env name name))
+      env))
+  
+  (match p
+    [(ProgramDefs info defs)
+     (let ([env (build-env defs)])
+       (ProgramDefs info (uniquify-defs defs env)))]))
+
+(define (reveal-functions-exp env)
+  (lambda (e)
+    (match e
+      [(Var x) (if (dict-has-key? env x)
+              (FunRef x (dict-ref env x))
+              (Var x))]
+      [(Let x e body)
+        (Let x
+        ((reveal-functions-exp env) e)
+        ((reveal-functions-exp env) body))]
+      [(Prim op es)
+       (Prim op (for/list ([e es]) ((reveal-functions-exp env) e)))]
+      [(If e1 e2 e3)
+       (If ((reveal-functions-exp env) e1) ((reveal-functions-exp env) e2) ((reveal-functions-exp env) e3))]
+      [(SetBang x e)
+       (SetBang x ((reveal-functions-exp env) e))]
+      [(Begin es e)
+       (Begin (for/list ([esp es]) ((reveal-functions-exp env) esp)) ((reveal-functions-exp env) e))]
+      [(WhileLoop cnd e)
+       (WhileLoop ((reveal-functions-exp env) cnd) ((reveal-functions-exp env) e))]
+      [(HasType expr type) (HasType ((reveal-functions-exp env) expr) type)]
+      [(Apply fun args)
+       (Apply
+        ((reveal-functions-exp env) fun)
+        (for/list ([arg args]) ((reveal-functions-exp env) arg)))]
+      [_ e])))
+
+(define (reveal-functions-defs defs function-info)
+  (map
+   (lambda (x)
+     (match x
+       [(Def name params rty info body)
+        (Def name params rty info ((reveal-functions-exp function-info) body))]))
+   defs))
+
+(define (reveal-functions p)
+  (match p
+    [(ProgramDefs info defs)
+     (let ([function-info
+            (map
+             (lambda (x)
+               (match x
+                 [(Def name params _ _ _) (cons name (length params))]))
+             defs)])
+       (ProgramDefs info (reveal-functions-defs defs function-info)))]))
+
+(define (limit-body-apply args)
+  (match args
+    [(list p1 p2 p3 p4 p5 ps ..2)
+      (list p1 p2 p3 p4 p5 (Prim 'vector ps))]
+    [_ args]))
+
+(define (limit-body env)
+  (lambda (e)
+    (match e
+      [(Var x) (if (dict-has-key? env x)
+              (dict-ref env x)
+              (Var x))]
+      [(FunRef x n) (if (dict-has-key? env x)
+              (dict-ref env x)
+              (FunRef x n))]
+      [(Let x e body)
+        (Let x
+        ((limit-body env) e)
+        ((limit-body env) body))]
+      [(Prim op es)
+       (Prim op (for/list ([e es]) ((limit-body env) e)))]
+      [(If e1 e2 e3)
+       (If ((limit-body env) e1) ((limit-body env) e2) ((limit-body env) e3))]
+      [(SetBang x e)
+       (SetBang x ((limit-body env) e))]
+      [(Begin es e)
+       (Begin (for/list ([esp es]) ((limit-body env) esp)) ((limit-body env) e))]
+      [(WhileLoop cnd e)
+       (WhileLoop ((limit-body env) cnd) ((limit-body env) e))]
+      [(HasType expr type) (HasType ((limit-body env) expr) type)]
+      [(Apply fun args)
+       (Apply
+        ((limit-body env) fun)
+        (map (limit-body env) (limit-body-apply args)))]
+      [_ e])))
+
+(define (get-name-from-param param)
+  (match param
+    [`(,x : ,t) x]))
+
+(define (limit-body-create-env params vector-name)
+  (match params
+    [(list p1 p2 p3 p4 p5 ps ..2)
+      (for/list 
+        ([i (in-range 0 (length ps))]
+         [p ps])
+        (cons 
+          (get-name-from-param p)
+          (Prim 'vector-ref (list (Var vector-name) (Int i)))))]
+    [_ '()]))
+
+(define (build-type-from-params params)
+  (cons
+   'Vector
+   (map
+    (lambda (x)
+      (match x
+        [`(,x : ,typ) typ]))
+    params)))
+
+(define (limit-types typ)
+  (match typ
+    [(list args ... '-> result ...)
+     (append
+      (limit-types
+       (match args
+         [(list p1 p2 p3 p4 p5 ps ..2)
+          (list p1 p2 p3 p4 p5 (cons 'Vector ps))]
+         [_ args]))
+      (list '->)
+      (limit-types result))]
+    [(list args ...) (map limit-types args)]
+    [_ typ]))
+
+(define (limit-params params vector-name)
+  (let
+      ([args (match params
+               [(list p1 p2 p3 p4 p5 ps ..2)
+                (list p1 p2 p3 p4 p5 `(,vector-name : ,(build-type-from-params ps)))]
+               [_ params])])
+    (map
+     (lambda (arg)
+       (match arg
+         [`(,arg : ,typ)
+          `(,arg : ,(limit-types typ))]))
+     args)))
+
+(define (limit-defs defs)
+  (map (lambda (def)
+         (let ([vector-name (gensym 'param-vector)])
+           (match def
+             [(Def name params rty info body)
+              (Def
+               name
+               (limit-params params vector-name)
+               (limit-types rty)
+               info
+               ((limit-body (limit-body-create-env params vector-name)) body))])))
+       defs))
+
+(define (limit-functions p)
+  (match p
+    [(ProgramDefs info defs)
+     (ProgramDefs info (limit-defs defs))]))
+
+(define (wrap-lets args arg-vars cont)
+  (match arg-vars
+    ['() cont]
+    [(list var more ...)
+     (Let var (car args)
+          (wrap-lets (cdr args) more cont))]))
+
+(define (make-prim op . exp*)
+  (Prim op exp*))
+
+(define (allocate-vector-space len)
+  (If (make-prim '<
+                 (make-prim '+ (GlobalValue 'free_ptr)
+                            (Int (+ 8 len)))
+                 (GlobalValue 'fromspace_end))
+      (Void)
+      (Collect (+ 8 len))))
+
+(define (set-allocation-vals vector-name vars idx)
+  (match vars
+    ['() '()]
+    [(list var more ...)
+     (cons
+      (make-prim 'vector-set! (Var vector-name) (Int idx) (Var var))
+      (set-allocation-vals vector-name more (+ idx 1)))]))
+
+(define (expose-allocation-exp exp)
+  (match exp
+    [(Prim op args)
+     (Prim op (map expose-allocation-exp args))]
+    [(Let x e t)
+     (Let x (expose-allocation-exp e) (expose-allocation-exp t))]
+    [(If e1 e2 e3)
+     (If (expose-allocation-exp e1) (expose-allocation-exp e2) (expose-allocation-exp e3))]
+    [(SetBang x e) (SetBang x (expose-allocation-exp e))]
+    [(Begin es e) (Begin (for/list ([esp es]) (expose-allocation-exp esp)) (expose-allocation-exp e))]
+    [(WhileLoop cnd e) (WhileLoop (expose-allocation-exp cnd) (expose-allocation-exp e))]
+    [(Apply fun args)
+     (Apply (expose-allocation-exp fun) (map expose-allocation-exp args))]
+
+    ; (has-type (vector e0 ... e_{n-1}) type)
+    [(HasType (Prim 'vector args) type)
+     (define new-args
+       (for/list ([arg args])
+         (expose-allocation-exp arg)))
+     (define arg-vars (for/list ([arg new-args]) (gensym 'vecarg)))
+     (define vector-name (gensym 'vector))
+     (define len (* 8 (length new-args)))
+     (define set-vec-vals (set-allocation-vals vector-name arg-vars 0))
+
+     (wrap-lets new-args arg-vars
+                (Begin
+                 (list (allocate-vector-space len))
+                 (Let vector-name (Allocate (length new-args) type)
+                      (Begin
+                       set-vec-vals
+                       (Var vector-name)))))]
+
+    [(HasType e type) (HasType (expose-allocation-exp e) type)]
+    [_ exp]))
+
+(define (expose-allocation p)
+  (match p
+    [(ProgramDefs info defs)
+      (ProgramDefs info 
+        (map 
+          (lambda (def) 
+            (match def
+              [(Def name params rty info body)
+                (Def name params rty info (expose-allocation-exp body))])) 
+          defs))]))
+
+(define (collect-set! e)
+  (match e
+    [(Var x) (set)]
+    [(FunRef x n) (set)]
+    [(Int x) (set)]
+    [(Bool x) (set)]
+    [(Void) (set)]
+    [(Allocate _ _) (set)]
+    [(GlobalValue _) (set)]
+    [(Collect _) (set)]
+    [(Prim op args)
+     (foldr (lambda (x v) (set-union v (collect-set! x))) (set) args)]
+    [(Let x e t) (set-union (collect-set! e) (collect-set! t))]
+    [(If e1 e2 e3)
+     (set-union (collect-set! e1) (collect-set! e2) (collect-set! e3))]
+    [(SetBang x e) (set-union (set x) (collect-set! e))]
+    [(Begin es e)
+     (foldr (lambda (x v) (set-union v (collect-set! x))) (collect-set! e) es)]
+    [(WhileLoop cnd e) (set-union (collect-set! cnd) (collect-set! e))]
+    [(HasType expr _) (collect-set! expr)]
+    [(Apply fun args)
+     (set-union
+      (collect-set! fun)
+      (foldr (lambda (x v) (set-union v (collect-set! x))) (set) args))]))
+
+(define (uncover-get!-exp set!-vars exp)
+  (match exp
+    [(Var x)
+     (if (set-member? set!-vars x)
+         (GetBang x)
+         (Var x))]
+    [(FunRef x n)
+     (if (set-member? set!-vars x)
+         (GetBang x)
+         (FunRef x n))]
+    [(Int x) exp]
+    [(Bool x) exp]
+    [(Void) exp]
+    [(Allocate _ _) exp]
+    [(GlobalValue _) exp]
+    [(Collect _) exp]
+    [(Prim op args)
+     (Prim op
+           (for/list ([arg args])
+             (uncover-get!-exp set!-vars arg)))]
+    [(Let x e t)
+     (Let x
+          (uncover-get!-exp set!-vars e)
+          (uncover-get!-exp set!-vars t))]
+    [(If e1 e2 e3)
+     (If (uncover-get!-exp set!-vars e1)
+         (uncover-get!-exp set!-vars e2)
+         (uncover-get!-exp set!-vars e3))]
+    [(SetBang x e)
+     (SetBang x (uncover-get!-exp set!-vars e))]
+    [(Begin es e)
+     (Begin
+      (for/list ([esp es])
+        (uncover-get!-exp set!-vars esp))
+      (uncover-get!-exp set!-vars e))]
+    [(WhileLoop cnd e)
+     (WhileLoop
+      (uncover-get!-exp set!-vars cnd)
+      (uncover-get!-exp set!-vars e))]
+    [(HasType expr type) (HasType (uncover-get!-exp set!-vars expr) type)]
+    [(Apply fun args)
+     (Apply 
+      (uncover-get!-exp set!-vars fun)
+           (for/list ([arg args])
+             (uncover-get!-exp set!-vars arg)))]))
+
+;; uncover-get! : Replace uses of mutable variables with (get! var)
+(define (uncover-get! p)
+  (match p
+    [(ProgramDefs info defs)
+      (ProgramDefs info 
+        (map 
+          (lambda (def) 
+            (match def
+              [(Def name params rty info body)
+                (Def name params rty info (uncover-get!-exp (collect-set! body) body))])) 
+          defs))]))
+
+; Given a list of expressions, build atoms from the and collect their
+; environment. Returns (list (list atoms), environment).
+(define (collect-env es)
+  (match es
+    ['() (list '() '())]
+    [(list ast rst ...)
+     (match (rco-atm ast)
+       [(list atm env)
+        (match (collect-env rst)
+          [(list atm-ret env-ret)
+           (list
+            (cons atm atm-ret)
+            (append env env-ret))])])]))
+
+(define (create-tmp-var)
+  (gensym "tmp"))
+
+(define (create-as-tmp-exp ast)
+  (let ([tmp-var (create-tmp-var)])
+    (list
+     (Var tmp-var)
+     (list (list tmp-var (rco-exp ast))))))
+
+; Given a AST, convert it into an atom.
+; Returns (list atom environment)
+(define (rco-atm ast)
+  (match ast
+    [(Int n) (list (Int n) '())]
+    [(Bool n) (list (Bool n) '())]
+    [(Var n) (list (Var n) '())]
+    [(Void) (list (Void) '())]
+    ; Convert body to an atom and return that. Push this Let into the
+    ; environment. This Let must come before the inside environment to
+    ; preserve order of executation of statements.
+    [(Let x e body)
+     (match (rco-atm body)
+       [(list atm env)
+        (list atm (append (list (list x (rco-exp e))) env))])]
+    ; Assign this exp variable and return enviroment as that assignment.
+    [(Prim op es) (create-as-tmp-exp ast)]
+    [(If e1 e2 e3) (create-as-tmp-exp ast)]
+    [(GetBang x) (create-as-tmp-exp ast)]
+    [(SetBang var exp) (create-as-tmp-exp ast)]
+    [(Begin exp-lst exp) (create-as-tmp-exp ast)]
+    [(WhileLoop cnd exp) (create-as-tmp-exp ast)]
+    [(Collect _) (create-as-tmp-exp ast)]
+    [(Allocate _ _) (create-as-tmp-exp ast)]
+    [(GlobalValue _) (create-as-tmp-exp ast)]
+    [(Apply _ _) (create-as-tmp-exp ast)]
+    [(FunRef _ _) (create-as-tmp-exp ast)]))
+
+(define (create-let-from-env env body)
+  (match env
+    ['() body]
+    [(list (list var e) more ...)
+     (Let var e (create-let-from-env more body))]))
+
+; Given a AST, remove complex expressions from it.
+; Returns an AST
+(define (rco-exp ast)
+  (match ast
+    [(Var x) ast]
+    [(FunRef x n) ast]
+    [(Int x) ast]
+    [(Bool x) ast]
+    [(Void) ast]
+    [(Collect _) ast]
+    [(Allocate _ _) ast]
+    [(GlobalValue _) ast]
+    [(Let x e body) (Let x (rco-exp e) (rco-exp body))]
+    [(Prim op es)
+     (match (collect-env es)
+       [(list atm-list env)
+        (create-let-from-env env (Prim op atm-list))])]
+    [(If e1 e2 e3) (If (rco-exp e1) (rco-exp e2) (rco-exp e3))]
+    [(GetBang var) (Var var)]
+    [(SetBang var exp) (SetBang var (rco-exp exp))]
+    [(Begin exp-lst exp)
+     (Begin
+      (for/list ([exp-atm exp-lst])
+        (rco-exp exp-atm))
+      (rco-exp exp))]
+    [(WhileLoop cnd exp) (WhileLoop (rco-exp cnd) (rco-exp exp))]
+    [(Apply fun args)
+     (match (collect-env args)
+       [(list atm-list env)
+        (match
+            (collect-env (list fun))
+          [(list (list fun-atm) fun-env)
+           (create-let-from-env (append env fun-env) (Apply fun-atm atm-list))])])]))
+
+; remove-complex-opera* : R1 -> R1
+(define (remove-complex-opera* p)
+  (match p
+    [(ProgramDefs info defs)
+     (ProgramDefs info
+                  (map
+                   (lambda (def)
+                     (match def
+                       [(Def name params rty info body)
+                        (Def name params rty info (rco-exp body))]))
+                   defs))]))
+
+(define basic-blocks '())
+
+(define (create-block tail)
+  (match tail
+    [(Goto label) (Goto label)]
+    [_ (let ([label (gensym 'block)])
+         (set! basic-blocks (cons (cons label tail) basic-blocks))
+         (Goto label))]))
+
+; Check if a Prim op is a cmp.
+(define (is-prim-cmp op)
+  (or (equal? op 'eq?)
+      (equal? op '<)
+      (equal? op '<=)
+      (equal? op '>)
+      (equal? op '>=)))
+
+(define (explicate-effect e cont)
+  (match e
+    [(Var x) cont]
+    [(FunRef x n) cont]
+    [(Int n) cont]
+    [(Bool n) cont]
+    [(Void) cont]
+    [(Collect _) (Seq e cont)]
+    [(Allocate _ _) (Seq e cont)]
+    [(GlobalValue _) (Seq e cont)]
+    [(Let y rhs body)
+     (explicate-assign rhs y (explicate-effect body cont))]
+    [(Prim 'read es) (Seq e cont)]
+    [(Prim 'vector-set! es) (Seq e cont)]
+    [(Prim op es) cont]
+    [(If cnd thn els)
+     (let ([cont-goto (create-block cont)])
+       (explicate-pred cnd
+                       (explicate-effect thn cont-goto)
+                       (explicate-effect els cont-goto)))]
+    [(WhileLoop cnd body)
+     (let* ([loop-label (gensym 'loop)]
+            [cont-goto (create-block cont)]
+            [loop-block
+             (explicate-pred cnd
+                             (create-block (explicate-effect body (Goto loop-label)))
+                             (create-block cont-goto))])
+       (set! basic-blocks
+             (cons (cons loop-label loop-block) basic-blocks))
+       (Goto loop-label))]
+    [(Begin es body)
+     (let ([cont-body (explicate-effect body cont)])
+       (foldr explicate-effect cont-body es))]
+    [(SetBang var rhs) (explicate-assign rhs var cont)]
+    [(Apply fun args) (Seq (Call fun args) cont)]
+    [else (error "explicate-effect unhandled case" e)]))
+
+; `thn`, `els` are assumed to be tails i.e. they are
+; already passed through explicate-tail.
+(define (explicate-pred cnd thn els)
+  (match cnd
+    [(Var x)
+     (IfStmt (Prim 'eq? (list cnd (Bool #t)))
+             (create-block thn)
+             (create-block els))]
+    [(Let x rhs body)
+     (explicate-assign rhs x (explicate-pred body thn els))]
+    [(Prim 'not (list e))
+     (explicate-pred e els thn)]
+    [(Prim op es) #:when (is-prim-cmp op)
+                  (IfStmt (Prim op es)
+                          (create-block thn)
+                          (create-block els))]
+    [(Prim op args)
+     (let ([tmp-var (create-tmp-var)])
+        (explicate-assign cnd tmp-var
+                          (IfStmt (Prim 'eq? (list (Var tmp-var) (Bool #t)))
+                                  (create-block thn)
+                                  (create-block els))))]
+    [(Apply fun args)
+     (let ([tmp-var (create-tmp-var)])
+        (explicate-assign cnd tmp-var
+                          (IfStmt (Prim 'eq? (list (Var tmp-var) (Bool #t)))
+                                  (create-block thn)
+                                  (create-block els))))]
+    [(Begin es body)
+     (let* ([tmp-var (create-tmp-var)]
+            [tail-body
+             (explicate-assign
+              body
+              tmp-var
+              (explicate-pred (Var tmp-var) thn els))])
+       (foldr explicate-effect tail-body es))]
+
+    [(Bool b) (if b thn els)]
+    ; Push cnd^ up and use thn^ and els^ as conditions for branches.
+    [(If cnd^ thn^ els^)
+     ; Create blocks for `thn` and `els` to prevent duplicates.
+     (let ([thn-goto (create-block thn)]
+           [els-goto (create-block els)])
+       (explicate-pred cnd^
+                       (explicate-pred thn^ thn-goto els-goto)
+                       (explicate-pred els^ thn-goto els-goto)))]
+    [else (error "explicate-pred unhandled case" cnd)]))
+
+(define (explicate-tail e)
+  (match e
+    [(Var x) (Return (Var x))]
+    [(FunRef x n) (Return (FunRef x n))]
+    [(Int n) (Return (Int n))]
+    [(Bool n) (Return (Bool n))]
+    [(Void) (Return (Void))]
+    [(Collect _) (Seq e (Return (Void)))]
+    [(Allocate _ _) (Seq e (Return (Void)))]
+    [(GlobalValue _) (Seq e (Return (Void)))]
+    [(Let x rhs body) (explicate-assign rhs x (explicate-tail body))]
+    [(Prim op es) (Return (Prim op es))]
+    [(If cnd thn els)
+     (explicate-pred cnd (explicate-tail thn) (explicate-tail els))]
+    [(WhileLoop cnd body)
+     (let* ([loop-label (gensym 'loop)]
+            [loop-block
+             (explicate-pred cnd
+                             (create-block (explicate-effect body (Goto loop-label)))
+                             (create-block (Return (Void))))])
+       (set! basic-blocks
+             (cons (cons loop-label loop-block) basic-blocks))
+       (Goto loop-label))]
+    [(Begin es body)
+     (let ([tail-body (explicate-tail body)])
+       (foldr explicate-effect tail-body es))]
+    [(SetBang var rhs) (explicate-assign rhs var (Return (Void)))]
+    [(Apply fun args) (TailCall fun args)]
+    [else (error "explicate-tail unhandled case" e)]))
+
+(define (explicate-assign e x cont)
+  (match e
+    [(Var y) (Seq (Assign (Var x) (Var y)) cont)]
+    [(FunRef y n) (Seq (Assign (Var x) (FunRef y n)) cont)]
+    [(Int n) (Seq (Assign (Var x) (Int n)) cont)]
+    [(Bool n) (Seq (Assign (Var x) (Bool n)) cont)]
+    [(Void) (Seq (Assign (Var x) (Void)) cont)]
+    [(Allocate _ _) (Seq (Assign (Var x) e) cont)]
+    [(GlobalValue _) (Seq (Assign (Var x) e) cont)]
+    [(Collect _) (Seq e (explicate-assign (Void) x cont))]
+    [(Let y rhs body)
+     (explicate-assign rhs y (explicate-assign body x cont))]
+    [(Prim op es) (Seq (Assign (Var x) (Prim op es)) cont)]
+    [(If cnd thn els)
+     (let ([cont-goto (create-block cont)])
+       (explicate-pred cnd
+                       (explicate-assign thn x cont-goto)
+                       (explicate-assign els x cont-goto)))]
+    [(WhileLoop cnd body)
+     (let* ([loop-label (gensym 'loop)]
+            [cont-goto (create-block cont)]
+            [loop-block
+             (explicate-pred cnd
+                             (create-block (explicate-effect body (Goto loop-label)))
+                             (create-block (explicate-assign (Void) x cont-goto)))])
+       (set! basic-blocks
+             (cons (cons loop-label loop-block) basic-blocks))
+       (Goto loop-label))]
+    [(Begin es body)
+     (let ([cont-body (explicate-assign body x cont)])
+       (foldr explicate-effect cont-body es))]
+    [(SetBang var rhs) (explicate-assign rhs var (Seq (Assign (Var x) (Void)) cont))]
+    [(Apply fun args) (Seq (Assign (Var x) (Call fun args)) cont)]
+    [else (error "explicate-assign unhandled case" e)]))
+
+(define (create-start-block-label name)
+  (string->symbol (string-append (symbol->string name) "start")))
+
+(define (create-conclude-block-label name)
+  (string->symbol (string-append (symbol->string name) "conclusion")))
+
+;; explicate-control : R1 -> C0
+(define (explicate-control p)
+  (match p
+    [(ProgramDefs info defs)
+     (ProgramDefs info
+                  (map
+                   (lambda (def)
+                     (set! basic-blocks '())
+                     (match def
+                       [(Def name params rty info body)
+                        (Def name params rty info
+                             (cons
+                              (cons
+                               (create-start-block-label name)
+                               (explicate-tail body))
+                              basic-blocks))]))
+                   defs))]))
+
+(define (select-atm atm)
+  (match atm
+    [(Var x) (Var x)]
+    [(Int n) (Imm n)]
+    [(Reg r) (Reg r)]
+    [(Void) (Imm 0)]
+    [(ByteReg r) (ByteReg r)]
+    ; #t => 1
+    ; #f => 0
+    [(Bool b) (if b (Imm 1) (Imm 0))]))
+
+(define (get-op-name prim)
+  (match prim
+    [(Prim '+ (list e1 e2)) 'addq]
+    [(Prim '- (list e1 e2)) 'subq]
+    [(Prim '- (list e1)) 'negq]))
+
+(define (get-cmp-set-op op)
+  (match op
+    ['eq? 'sete]
+    ['< 'setl]
+    ['<= 'setle]
+    ['> 'setg]
+    ['>= 'setge]))
+
+(define (8n+1 n)
+  (* 8 (+ n 1)))
+
+(define (type-mask type [mask 0])
+  (match type
+    [(list 'Vector) mask]
+    [(list 'Vector (list 'Vector _ ...) more ...)
+     (type-mask (cons 'Vector more)
+                (bitwise-ior 1 (arithmetic-shift mask 1)))]
+    [(list 'Vector _ more ...)
+     (type-mask (cons 'Vector more) (arithmetic-shift mask 1))]))
+
+(define (calculate-tag len type)
+  (bitwise-ior 1
+               (arithmetic-shift len 1)
+               (arithmetic-shift (type-mask type) 7)))
+
+(define (convert-to-regs names) (for/list ([reg names]) (Reg reg)))
+(define function-call-list (convert-to-regs (list 'rdi 'rsi 'rdx 'rcx 'r8 'r9)))
+
+(define (select-assign x e)
+  (match e
+    ; movq e, x
+    [atm #:when (atm? atm)
+         (list (Instr 'movq (list (select-atm atm) x)))]
+
+    [(FunRef fun airty)
+     (list (Instr 'leaq (list (Global fun) x)))]
+
+    [(GlobalValue var)
+     (list
+      (Instr 'movq (list (Global var) x)))]
+
+    ; not x because e1 = x
+    [(Prim 'not (list e1)) #:when (equal? e1 x)
+                           (list (Instr 'xorq (list (Imm 1) (select-atm x))))]
+    ; movq e1, x ; not x
+    [(Prim 'not (list e1))
+     (list
+      (Instr 'movq (list (select-atm e1) x))
+      (Instr 'xorq (list (Imm 1) (select-atm x))))]
+
+    [(Prim 'read '())
+     (list
+      (Callq 'read_int 0)
+      (Instr 'movq (list (Reg 'rax) (select-atm x))))]
+
+    [(Prim 'vector-ref (list name (Int idx)))
+     (list
+      (Instr 'movq (list (select-atm name) (Reg 'r11)))
+      (Instr 'movq (list (Deref 'r11 (8n+1 idx)) (select-atm x))))]
+
+    [(Prim 'vector-set! (list name (Int idx) var))
+     (list
+      (Instr 'movq (list (select-atm name) (Reg 'r11)))
+      (Instr 'movq (list (select-atm var) (Deref 'r11 (8n+1 idx))))
+      (Instr 'movq (list (Imm 0) (select-atm x))))]
+
+    [(Prim 'vector-length (list name))
+     (list
+      (Instr 'movq (list (select-atm name) (Reg 'r11)))
+      (Instr 'movq (list (Deref 'r11 0) (Reg 'rax)))
+      (Instr 'sarq (list (Reg 'rax)))
+      (Instr 'andq (list (Imm 63) (Reg 'rax)))
+      (Instr 'movq (list (Reg 'rax) (select-atm x))))]
+
+    ; (cmp e1 e2) => cmpq e2 e1, setcc %al, movzbq %al x
+    [(Prim op (list e1 e2)) #:when (is-prim-cmp op)
+                            (list
+                             (Instr 'cmpq (list (select-atm e2) (select-atm e1)))
+                             (Instr (get-cmp-set-op op) (list (ByteReg 'al)))
+                             (Instr 'movzbq (list (Reg 'al) (select-atm x))))]
+
+    ; op x because e1 = x
+    [(Prim op (list e1)) #:when (equal? e1 x)
+                         (list (Instr (get-op-name e) (list (select-atm x))))]
+    ; movq e1, x ; op x
+    [(Prim op (list e1))
+     (list
+      (Instr 'movq (list (select-atm e1) (select-atm x)))
+      (Instr (get-op-name e) (list (select-atm x))))]
+
+    ; op e2 x because e1 = x
+    [(Prim op (list e1 e2)) #:when (equal? e1 x)
+                            (list (Instr
+                                   (get-op-name e)
+                                   (list (select-atm e2) x)))]
+    ; movq e1, x ; op e2, x
+    [(Prim op (list e1 e2))
+     (list
+      (Instr 'movq (list (select-atm e1) (select-atm x)))
+      (Instr (get-op-name e) (list (select-atm e2) (select-atm x))))]
+
+    [(Allocate len type)
+     (list
+      (Instr 'movq (list (Global 'free_ptr) (Reg 'r11)))
+      (Instr 'addq (list (Imm (8n+1 len)) (Global 'free_ptr)))
+      (Instr 'movq (list (Imm (calculate-tag len type)) (Deref 'r11 0)))
+      (Instr 'movq (list (Reg 'r11) (select-atm x))))]
+
+    [(Call fun args)
+     (append
+      (select-stmt e)
+      (list (Instr 'movq (list (Reg 'rax) x))))]
+
+    [else (error "select-assign unhandled case" e)]))
+
+(define (select-stmt stmt)
+  (match stmt
+    [(Return e) (select-assign (Reg 'rax) e)]
+    [(Assign x e) (select-assign x e)]
+    [(Prim 'read '())
+     (list (Callq 'read_int 0))]
+    [(Prim 'vector-set! (list name (Int idx) x))
+     (list
+      (Instr 'movq (list (select-atm name) (Reg 'r11)))
+      (Instr 'movq (list (select-atm x) (Deref 'r11 (8n+1 idx)))))]
+    [(Collect size)
+     (list
+      (Instr 'movq (list (Reg 'r15) (Reg 'rdi)))
+      (Instr 'movq (list (Imm size) (Reg 'rsi)))
+      (Callq 'collect 2))]
+    [(Call fun args)
+     (append
+      (for/list ([reg function-call-list]
+                 [arg args])
+        (Instr 'movq (list (select-atm arg) reg)))
+      (list (IndirectCallq fun (length args))))]
+    [else (error "select-stmt unhandled case" stmt)]))
+
+(define (get-cmp-cnd op)
+  (match op
+    ['eq? 'e]
+    ['< 'l]
+    ['<= 'le]
+    ['> 'g]
+    ['>= 'ge]))
+
+; if (cmp e1 e2) thn els =>
+; cmpq e2 e1
+; je (label thn)
+; jmp (label els)
+(define (select-if cnd thn els)
+  (let ([label1 (match thn [(Goto label) label])]
+        [label2 (match els [(Goto label) label])])
+    (match cnd
+      [(Prim op (list e1 e2))
+       #:when (is-prim-cmp op)
+       (list (Instr 'cmpq (list (select-atm e2) (select-atm e1)))
+             (JmpIf (get-cmp-cnd op) label1)
+             (Jmp label2))])))
+
+(define function-name null)
+
+(define (select-tail t)
+  (match t
+    [(Return x) (append (select-stmt t) (list (Jmp (create-conclude-block-label function-name))))]
+    [(Seq assign tail) (append (select-stmt assign) (select-tail tail))]
+    [(Goto label) (list (Jmp label))]
+    [(IfStmt cnd thn els) (select-if cnd thn els)]
+    [(TailCall fun args)
+     (append
+      (for/list ([reg function-call-list]
+                 [arg args])
+        (Instr 'movq (list (select-atm arg) reg)))
+      (list (TailJmp fun (length args))))]
+    [else (error "select-tail unhandled case" t)]))
+
+(define (select-block params name)
+  (set! function-name name)
+  (lambda (x)
+    (let ([call-list
+           (if (eq? (car x) (create-start-block-label name))
+               (for/list ([reg function-call-list]
+                          [param params])
+                 (Instr 'movq (list reg (Var (car param)))))
+               '())])
+      (cons (car x) (Block '() (append call-list (select-tail (cdr x))))))))
+
+;; select-instructions : C0 -> pseudo-x86
+(define (select-instructions p)
+  (match p
+    [(ProgramDefs info defs)
+     (ProgramDefs info
+                  (map
+                   (lambda (def)
+                     (match def
+                       [(Def name params rty info body)
+                        (Def name '() 'Integer (dict-set info 'num-params (length params))
+                             (map
+                              (select-block params name)
+                              body))]))
+                   defs))]))
+
+(define caller-saved-list (convert-to-regs (list 'rax 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11)))
+(define callee-saved-list (convert-to-regs (list 'rsp 'rbp 'rbx 'r12 'r13 'r14 'r15)))
+(define labels->live (make-hash))
+(define labels->blocks (make-hash))
+
+; Assumes that the registers used for Deref are either %rax or %r11.
+(define (sanitize-locations->set . atm*)
+  (list->set
+   (filter
+    (lambda (x)
+      (match x
+        [(Var _) #t]
+        [(Reg _) #t]
+        [(ByteReg _) #t]
+        [(FunRef _ _) #f]
+        [(Imm _) #f]
+        [(Deref _ _) #f]
+        [(Global _) #f]))
+    atm*)))
+
+;; Get all write locations from an instruction.
+(define (get-write-locations instr)
+  (match instr
+    ; `cmpq` instructions do not write.
+    [(Instr 'cmpq _) (set)]
+    [(Instr _ `(,arg1 ,arg2)) (sanitize-locations->set arg2)]
+    [(Instr _ `(,arg1)) (sanitize-locations->set arg1)]
+    [(Callq _ _) (list->set caller-saved-list)]
+    [(IndirectCallq _ _) (list->set caller-saved-list)]
+    [(TailJmp _ _) (list->set caller-saved-list)]
+    [(Jmp _) (set)]
+    [(JmpIf _ _) (set)]
+    [_ (error "Unimplemented instruction" instr)]))
+
+;; Get all read locations from an instruction.
+(define (get-read-locations instr)
+  (set-subtract
+   (match instr
+     [(Instr 'movq (list arg1 arg2)) (sanitize-locations->set arg1)]
+     [(Instr 'movzbq (list arg1 arg2)) (sanitize-locations->set arg1)]
+     [(Instr 'leaq (list arg1 arg2)) (sanitize-locations->set arg1)]
+     [(Instr _ (list arg1 arg2)) (sanitize-locations->set arg1 arg2)]
+     [(Instr _ (list arg1)) (sanitize-locations->set arg1)]
+     [(Callq _ airty) (list->set (take function-call-list airty))]
+     [(IndirectCallq target airty) 
+      (set-union (sanitize-locations->set target) (list->set (take function-call-list airty)))]
+     [(TailJmp target airty) 
+      (set-union (sanitize-locations->set target) (list->set (take function-call-list airty)))]
+     [(Jmp _) (set)]
+     [(JmpIf _ _) (set)]
+     [_ (error "Unimplemented instruction?" instr)])
+   (get-write-locations instr)))
+
+;; L_after(k) = (L_after(k + 1) - W(k + 1)) + R(k + 1)
+(define (compute-L_afterk L_afterk+1 instrk+1)
+  (set-union (set-subtract L_afterk+1
+                           (get-write-locations instrk+1))
+             (get-read-locations instrk+1)))
+
+(define (liveness-analysis-instrs instrs live->after)
+  (match instrs
+    ; jmpcc, jmp -> use labels->live
+    [(list (JmpIf _ target1) (Jmp target2))
+     (list live->after live->after)]
+    ; jmp -> use labels->live
+    [(list (Jmp target))
+     (list live->after)]
+    [(list (TailJmp _ _))
+     (list live->after)]
+    ; Base case.
+    [(list _ instrk+1 _ ...)
+     (let* ([anal (liveness-analysis-instrs (rest instrs) live->after)]
+            [L_afterk+1 (car anal)])
+       (cons (compute-L_afterk L_afterk+1 instrk+1) anal))]))
+
+;; Given a block, do a pass of backward dataflow analysis on it.
+(define (liveness-analysis-block block label live->after)
+  (match block
+    [(Block blkinfo instrs)
+     (let* ([liveness (liveness-analysis-instrs instrs live->after)]
+            [label-liveness (compute-L_afterk
+                             (car liveness)
+                             (car instrs))])
+       ; Set liveness information for this label.
+       (dict-set! labels->live label label-liveness)
+       ; Attach livness to this block and return it.
+       (Block
+        (dict-set blkinfo 'liveness liveness)
+        instrs))]))
+
+;; Given a list of (cons label block), build a CFG.
+(define (build-liveness-cfg label-block-lst name)
+  (let ([cfg (directed-graph '())])
+    ; Traverse through all blocks.
+    (for ([label-block label-block-lst])
+      (match label-block
+        [(cons label block)
+         (match block
+           [(Block blkinfo instrs)
+            ; Traverse through all instructions of a block.
+            (for ([instr instrs])
+              (match instr
+                ; For each instruction add edge in CFG for a jump.
+                [(JmpIf _ target) (add-directed-edge! cfg label target)]
+                [(Jmp target) (add-directed-edge! cfg label target)]
+                [(TailJmp _ _) (add-directed-edge! cfg label (create-conclude-block-label name))]
+                [_ null]))])]))
+    cfg))
+
+(define (analyze_dataflow G transfer bottom join)
+  (define mapping (make-hash))
+  (for ([v (in-vertices G)])
+    (dict-set! mapping v bottom))
+  (define worklist (make-queue))
+  (for ([v (in-vertices G)])
+    (enqueue! worklist v))
+  (define trans-G (transpose G))
+  (while (not (queue-empty? worklist))
+         (define node (dequeue! worklist))
+         (define input (for/fold ([state bottom])
+                                 ([pred (in-neighbors trans-G node)])
+                         (join state (dict-ref mapping pred))))
+         (define output (transfer node input))
+         (cond [(not (equal? output (dict-ref mapping node)))
+                (dict-set! mapping node output)
+                (for ([v (in-neighbors G node)])
+                  (enqueue! worklist v))]))
+  mapping)
+
+(define (liveness-transfer name)
+  (lambda (label live->after) 
+    (if (eq? label (create-conclude-block-label name))
+      (set)
+      (let* ([blk (dict-ref labels->blocks label)]
+             [update-blk (liveness-analysis-block blk label live->after)])
+        (dict-set! labels->blocks label update-blk)
+        (dict-ref labels->live label)))))
+
+;; Given a list of (cons label block), do liveness analysis.
+(define (liveness-analysis-blocks label-block-lst name)
+  (set! labels->live (make-hash))
+  (set! labels->blocks (make-hash))
+  (let* ([cfg (transpose (build-liveness-cfg label-block-lst name))])
+    ; Set label -> block mapping in labels->blocks
+    (for ([label-block label-block-lst])
+      (match label-block
+        [(cons label block) (dict-set! labels->blocks label block)]))
+    ; Run dataflow analysis
+    (analyze_dataflow cfg (liveness-transfer name) (set) set-union)
+    ; Return blocks with liveness set
+    (hash->list labels->blocks)))
+
+;; Uncover live pass : Analysis to find live variables.
+(define (uncover-live p)
+  (match p
+    [(ProgramDefs info defs)
+     (ProgramDefs info
+                  (map
+                   (lambda (def)
+                     (match def
+                       [(Def name params rty info body)
+                        (Def name params rty info (liveness-analysis-blocks body name))]))
+                   defs))]))
+
+; Add conflicts between set1 and set2
+(define (add-interference set1 set2 graph)
+  (for* ([s1 set1]
+         [s2 set2])
+    (add-edge! graph s1 s2))
+  graph)
+
+(define (add-vertices-interference! instr graph)
+  (match instr
+    [(Instr op args)
+     (for ([arg args])
+       (if (not (Imm? arg))
+           (add-vertex! graph arg)
+           void))]
+    [_ void]))
+
+(define (is-vector-type locals-type var)
+  (dict-has-key? locals-type var)
+  (match (dict-ref locals-type var)
+    [(list 'Vector _ ...) #t]
+    [_ #f]))
+
+(define (build-interference-instr L_afterk instr graph locals-type)
+  (add-vertices-interference! instr graph)
+  (match instr
+    ; Add edge between (d, v) \forall v \in L_after(k) | v != s or v != d
+    [(Instr op (list s d))
+     #:when (or (eq? op 'movq) (eq? op 'movzbq))
+     (add-vertex! graph s)
+     (add-vertex! graph d)
+     ; Add edges
+     (let* ([filtered_L (set-subtract L_afterk (set s d))])
+       (add-interference filtered_L (set d) graph))]
+    ; For callq collect, add edges between callee-saved registers registers and live vector types.
+    [(Callq 'collect 2)
+     (let* ([write-locs (get-write-locations instr)]
+            [filtered_L (set-subtract L_afterk write-locs)])
+       (add-interference filtered_L write-locs graph))
+     (define (get-label var)
+       (match var [(Var x) x] [_ null]))
+     (add-interference
+      (for/set ([var (set->list L_afterk)]
+                #:when (and (not (null? (get-label var)))
+                            (is-vector-type locals-type (get-label var))))
+        var)
+      callee-saved-list
+      graph)
+     ]
+    [(IndirectCallq _ _)
+     (let* ([write-locs (get-write-locations instr)]
+            [filtered_L (set-subtract L_afterk write-locs)])
+       (add-interference filtered_L write-locs graph))
+     (define (get-label var)
+       (match var [(Var x) x] [_ null]))
+     (add-interference
+      (for/set ([var (set->list L_afterk)]
+                #:when (and (not (null? (get-label var)))
+                            (is-vector-type locals-type (get-label var))))
+        var)
+      callee-saved-list
+      graph)
+     ]
+    [(TailJmp _ _)
+     (let* ([write-locs (get-write-locations instr)]
+            [filtered_L (set-subtract L_afterk write-locs)])
+       (add-interference filtered_L write-locs graph))
+     (define (get-label var)
+       (match var [(Var x) x] [_ null]))
+     (add-interference
+      (for/set ([var (set->list L_afterk)]
+                #:when (and (not (null? (get-label var)))
+                            (is-vector-type locals-type (get-label var))))
+        var)
+      callee-saved-list
+      graph)
+     ]
+    ; For any other instruction, (d, v) \forall d \in write(instr) v \in L_afterk | v != d
+    [_
+     (let* ([write-locs (get-write-locations instr)]
+            [filtered_L (set-subtract L_afterk write-locs)])
+       (add-interference filtered_L write-locs graph))]))
+
+(define (build-interference-instrs liveness instrs graph locals-type)
+  (match instrs
+    ['() graph]
+    [(list instr rest-instrs ...)
+     (build-interference-instrs
+      (cdr liveness)
+      rest-instrs
+      (build-interference-instr (car liveness) instr graph locals-type) locals-type)]))
+
+(define (build-interference-blocks blocks graph locals-type)
+  (match blocks
+    ['() graph]
+    [(list (cons _ (Block blkinfo instrs)) rest-blocks ...)
+     (build-interference-blocks
+      rest-blocks
+      (build-interference-instrs
+       (dict-ref blkinfo 'liveness) instrs graph locals-type)
+      locals-type)]))
+
+;; Build Interference Graph : Analysis to find register conflicts.
+(define (build-interference p)
+  (match p
+    [(ProgramDefs info defs)
+     (ProgramDefs info
+                  (map
+                   (lambda (def)
+                     (match def
+                       [(Def name params rty info body)
+                        (Def 
+                          name 
+                          params 
+                          rty 
+                          (dict-set 
+                            info 
+                            'conflicts 
+                            (build-interference-blocks 
+                              body 
+                              (undirected-graph '()) 
+                              (dict-ref info 'locals-types))) 
+                          body)]))
+                   defs))]))
+
+; TODO: Update priority of graph neighbours.
+(define (color-graph-update-queue graph queue v) queue)
+
+; Given a set of colors, find the MEX starting from 0.
+(define (get-mex-color s)
+  (define (get-mex-color-start s t)
+    (if
+     (set-member? s t)
+     (get-mex-color-start s (+ t 1))
+     t))
+  (get-mex-color-start s 0))
+
+; Given a set of colors, find the MEX starting from 0, but for numbers greater
+; than 10, start from -6 and keep going down.
+(define (get-mex-heap-color s)
+  (define (get-mex-heap-color-start s t)
+    (if (set-member? s t)
+        (get-mex-heap-color-start
+         s
+         (cond
+           [(eq? t 10) -6]
+           [(<= t -6) (- t 1)]
+           [else (+ t 1)]))
+        t))
+  (get-mex-heap-color-start s 0))
+
+; Returns -1 for unassigned neighbors. This doesn't affect
+; algorithm since we cannot assign -1 anyway.
+(define (get-neighbor-colors graph current-mapping v)
+  (for/set ([n (in-neighbors graph v)])
+    (if (dict-has-key? current-mapping n)
+        (dict-ref current-mapping n)
+        -1)))
+
+(define (color-graph-update-mapping graph current-mapping v locals-type)
+  (dict-set
+   current-mapping
+   v
+   (match v
+     [(Var x) #:when (is-vector-type locals-type x)
+              (get-mex-heap-color (get-neighbor-colors graph current-mapping v))]
+     [_ (get-mex-color (get-neighbor-colors graph current-mapping v))])))
+
+(define (color-graph-recurse graph queue current-mapping locals-type)
+  (if
+   (= (pqueue-count queue) 0)
+   current-mapping
+   (let ([v (vector-ref (pqueue-pop! queue) 0)])
+     (color-graph-recurse
+      graph
+      (color-graph-update-queue graph queue v)
+      (color-graph-update-mapping graph current-mapping v locals-type)
+      locals-type))))
+
+; Vertices are stored in priority queue as (vertex, priority)
+(define (color-graph-<= v1 v2)
+  (>= (vector-ref v1 1) (vector-ref v2 1)))
+
+(define unassignable-register-mapping
+  (list (cons (ByteReg 'al) -5)
+        (cons (Reg 'rbp) -4)
+        (cons (Reg 'r15) -3)
+        (cons (Reg 'r11) -2)
+        (cons (Reg 'rax) -1)
+        (cons (Reg 'rbx)  0)
+        (cons (Reg 'rcx)  1)
+        (cons (Reg 'rdx)  2)
+        (cons (Reg 'rsi)  3)
+        (cons (Reg 'rdi)  4)
+        (cons (Reg 'r8)   5)
+        (cons (Reg 'r9)   6)
+        (cons (Reg 'r10)  7)
+        (cons (Reg 'r12)  8)
+        (cons (Reg 'r13)  9)
+        (cons (Reg 'r14) 10)))
+
+(define (get-vertex-priority graph v)
+  (sequence-length (in-neighbors graph v)))
+
+(define (color-graph graph locals-type)
+  (let* ([queue (make-pqueue color-graph-<=)])
+    (for ([v (in-vertices graph)])
+      (match v
+        [(Reg _) void]
+        [_ (pqueue-push! queue (vector v (get-vertex-priority graph v)))]))
+    (color-graph-recurse graph queue unassignable-register-mapping locals-type)))
+
+(define color-to-register-mapping
+  (list (cons  0  (Reg 'rbx))
+        (cons  1  (Reg 'rcx))
+        (cons  2  (Reg 'rdx))
+        (cons  3  (Reg 'rsi))
+        (cons  4  (Reg 'rdi))
+        (cons  5  (Reg 'r8))
+        (cons  6  (Reg 'r9))
+        (cons  7  (Reg 'r10))
+        (cons  8  (Reg 'r12))
+        (cons  9  (Reg 'r13))
+        (cons  10 (Reg 'r14))))
+
+(define (get-stack-loc color)
+  (* -8 (+ (- color (length color-to-register-mapping)) 1)))
+
+(define (get-root-stack-loc color)
+  (* -8 (+ (- (+ color 6)) 1)))
+
+(define (spill-to-stack color)
+  (if (>= color 0)
+      (Deref 'rbp (get-stack-loc color))
+      (Deref 'r15 (get-root-stack-loc color))))
+
+(define (get-mapping-from-color color)
+  (if (dict-has-key? color-to-register-mapping color)
+      (dict-ref color-to-register-mapping color)
+      (spill-to-stack color)))
+
+(define (allocate-registers-arg arg allocation locals-type)
+  (match arg
+    [(Var x) (get-mapping-from-color (dict-ref allocation arg))]
+    [_ arg]))
+
+; Assumes `Instrs` is the only instruction that can have arguements is `Instr`.
+(define (allocate-registers-instrs instrs allocation locals-type)
+  (for/list ([instr instrs])
+    (match instr
+      [(Instr name args)
+       (Instr name (for/list ([arg args])
+                     (allocate-registers-arg arg allocation locals-type)))]
+      [(IndirectCallq name arity)
+       (IndirectCallq 
+        (allocate-registers-arg name allocation locals-type) 
+        arity)]
+      [(TailJmp name arity)
+       (TailJmp 
+        (allocate-registers-arg name allocation locals-type) 
+        arity)]
+      [_ instr])))
+
+(define (allocate-registers-blocks blocks allocation locals-type)
+  (for/list ([block blocks])
+    (match block
+      [(cons label (Block blkinfo instrs))
+       (cons label (Block blkinfo (allocate-registers-instrs instrs allocation locals-type)))])))
+
+;; Allocate registers : Take out interference graph from info of program and do register allocation.
+(define (allocate-registers p)
+  (match p
+    [(ProgramDefs info defs)
+     (ProgramDefs
+      info
+      (map
+       (lambda (def)
+         (match def
+           [(Def name params rty info blocks)
+            (let*
+                ([allocation (color-graph (dict-ref info 'conflicts) (dict-ref info 'locals-types))]
+                 [info-root
+                  (dict-set
+                   info
+                   'num-root-spills
+                   (max (- (+ 5 (apply min (map (lambda (x) (cdr x)) allocation)))) 0))]
+                 [info-stack
+                  (dict-set
+                   info-root
+                   'num-stack-spills
+                   (max (- (apply max (map (lambda (x) (cdr x)) allocation)) 11) 0))])
+              (Def name params rty info-stack (allocate-registers-blocks blocks allocation (dict-ref info 'locals-types))))]
+           ))
+       defs))]))
+
+(define is-tail-jmp #f)
+
+(define (patch-instrs-list instrs name)
+  (match instrs
+    ['() '()]
+    [(list (Instr 'movq (list a b)) more ...)
+     #:when (equal? a b)
+     (patch-instrs-list more name)]
+    [(list (Instr op (list a b)) more ...)
+     #:when (and (Deref? a) (Deref? b))
+     (append
+      (list (Instr 'movq (list a (Reg 'rax))))
+      (list (Instr op (list (Reg 'rax) b)))
+      (patch-instrs-list more name))]
+    [(list (Instr 'cmpq (list a (Imm b))) more ...)
+     (append
+      (list (Instr 'movq (list (Imm b) (Reg 'rax))))
+      (list (Instr 'cmpq (list a (Reg 'rax))))
+      (patch-instrs-list more name))]
+    [(list (Instr 'movzbq (list a (Deref b num))) more ...)
+     (append
+      (list (Instr 'movzbq (list a (Reg 'rax))))
+      (list (Instr 'movq (list (Reg 'rax) (Deref b num))))
+      (patch-instrs-list more name))]
+    [(list (Instr 'leaq (list a (Deref b num))) more ...)
+      (append
+       (list (Instr 'leaq (list a (Reg 'rax))))
+       (list (Instr 'movq (list (Reg 'rax) (Deref b num))))
+       (patch-instrs-list more name))]
+    [(list (TailJmp target arity) more ...)
+      (set! is-tail-jmp #t)
+      (append
+       (list (Instr 'movq (list target (Reg 'rax))))
+       (list (Jmp (create-conclude-block-label name)))
+       (patch-instrs-list more name))]
+    [(list instr more ...)
+     (cons
+      instr
+      (patch-instrs-list more name))]))
+
+(define (patch-instructions-blocks label-block-lst name)
+  (for/list ([label-block label-block-lst])
+    (match label-block
+      [(cons label block)
+       (match block
+         [(Block blkinfo instrs)
+          (cons label (Block blkinfo (patch-instrs-list instrs name)))])])))
+
+;; patch-instructions : psuedo-x86 -> x86
+(define (patch-instructions p)
+  (match p
+    [(ProgramDefs info defs)
+     (ProgramDefs
+      info
+      (map
+       (lambda (def)
+         (set! is-tail-jmp #f)
+         (match def
+           [(Def name params rty info blocks)
+            (let ([new-blocks (patch-instructions-blocks blocks name)])
+              (Def name params rty (dict-set info 'tailjmp? is-tail-jmp) new-blocks))]))
+       defs))]))
+
+
+(define (initialize-root-stack name)
+  (if (eq? name 'main)
+      (list (Instr 'movq (list (Imm 16384) (Reg 'rdi)))
+            (Instr 'movq (list (Imm 16384) (Reg 'rsi)))
+            (Callq 'initialize 2)
+            (Instr 'movq (list (Global 'rootstack_begin) (Reg 'r15))))
+      '()))
+
+(define (generate-prelude stack-spills root-spills name)
+  (list (cons
+         name
+         (Block '()
+                (append
+                 (list (Instr 'pushq (list (Reg 'rbp)))
+                       (Instr 'pushq (list (Reg 'rbx)))
+                       (Instr 'pushq (list (Reg 'r12)))
+                       (Instr 'pushq (list (Reg 'r13)))
+                       (Instr 'pushq (list (Reg 'r14)))
+                       (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
+                       (Instr 'subq (list (Imm (align (* 8 stack-spills) 16)) (Reg 'rsp))))
+                 (initialize-root-stack name)
+                 (list (Instr 'movq (list (Imm 0) (Deref 'r15 0)))
+                       (Instr 'addq (list (Imm (align (* 8 root-spills) 16)) (Reg 'r15)))
+                       (Jmp (create-start-block-label name))))))))
+
+(define (generate-conclusion stack-spills root-spills name tailjmp?)
+  (list (cons
+         (create-conclude-block-label name)
+         (Block '()
+                (list (Instr 'addq (list (Imm (align (* 8 stack-spills) 16)) (Reg 'rsp)))
+                      (Instr 'popq (list (Reg 'r14)))
+                      (Instr 'popq (list (Reg 'r13)))
+                      (Instr 'popq (list (Reg 'r12)))
+                      (Instr 'popq (list (Reg 'rbx)))
+                      (Instr 'subq (list (Imm (align (* 8 root-spills) 16)) (Reg 'r15)))
+                      (Instr 'popq (list (Reg 'rbp)))
+                      (if (eq? tailjmp? #t)
+                          (IndirectJmp (Reg 'rax))
+                          (Retq)))))))
+
+;; prelude-and-conclusion : x86 -> x86
+(define (prelude-and-conclusion p)
+  (match p
+    [(ProgramDefs info defs)
+     (ProgramDefs
+      info
+      (map
+       (lambda (def)
+         (match def
+           [(Def name params rty info blocks)
+            (Def name params rty info
+                 (append (generate-prelude
+                          (dict-ref info 'num-stack-spills)
+                          (dict-ref info 'num-root-spills)
+                          name)
+                         blocks
+                         (generate-conclusion
+                          (dict-ref info 'num-stack-spills)
+                          (dict-ref info 'num-root-spills)
+                          name
+                          (dict-ref info 'tailjmp?))
+                         ))]))
+       defs))]))
+
+(define (unroll-defs p)
+  (match p
+    [(ProgramDefs info defs)
+     (X86Program info
+                 (apply append
+                        (map
+                         (lambda (def)
+                           (match def
+                             [(Def name params rty info blocks) blocks])) defs)))]))
+
+;; Define the compiler passes to be used by interp-tests and the grader
+;; Note that your compiler file (the file that defines the passes)
+;; must be named "compiler.rkt"
+(define compiler-passes
+  `(("shrink" ,shrink ,interp-Lfun ,type-check-Lfun)
+    ("uniquify" ,uniquify ,interp-Lfun ,type-check-Lfun)
+    ("reveal functions" ,reveal-functions ,interp-Lfun-prime ,type-check-Lfun)
+    ("limit functions" ,limit-functions ,interp-Lfun-prime ,type-check-Lfun)
+    ("expose allocation" ,expose-allocation ,interp-Lfun-prime ,type-check-Lfun)
+    ("uncover get!" ,uncover-get!, interp-Lfun-prime ,type-check-Lfun)
+    ("remove complex opera*" ,remove-complex-opera* ,interp-Lfun-prime ,type-check-Lfun)
+    ("explicate control" ,explicate-control ,interp-Cfun ,type-check-Cfun)
+    ("instruction selection" ,select-instructions #f)
+    ("uncover live" ,uncover-live #f)
+    ("build interference graph" ,build-interference #f)
+    ("allocate registers" ,allocate-registers #f)
+    ("patch instructions" ,patch-instructions #f)
+    ("prelude-and-conclusion" ,prelude-and-conclusion #f)
+    ("unroll defs" ,unroll-defs #f)
+    ))
